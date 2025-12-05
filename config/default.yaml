@@ -1,0 +1,66 @@
+# TRM Training Configuration
+
+# Data settings
+data:
+  data_dir: "test_dataset"
+  max_audio_length: 2.0  # seconds (reduce for memory)
+  sample_rate: 24000
+  val_ratio: 0.1
+
+# Model architecture
+model:
+  embed_dim: 256
+  hidden_dim: 512
+  vocab_size: 2048  # Mimi codebook size
+  num_codebooks: 32  # Mimi uses 32 codebooks (RVQ)
+
+  # Recursive parameters (core TRM settings)
+  L_layers: 2      # Depth of recursive blocks
+  H_cycles: 3      # High-level improvement steps (K)
+  L_cycles: 6      # Low-level recursive cycles (n)
+
+  # Architecture
+  use_attention: true  # false = MLP-only (mlp_t variant)
+  num_heads: 8
+  dropout: 0.1
+
+  # Positional encoding
+  max_seq_len: 4096
+  pos_encodings: "sinusoidal"  # sinusoidal, learned, none
+
+# Training settings
+training:
+  epochs: 100
+  batch_size: 8
+  
+  # Optimizer
+  lr: 1e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  
+  # Scheduler
+  scheduler: "cosine"
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  
+  # Regularization
+  grad_clip: 1.0
+  dropout: 0.1
+  
+  # Mixed precision
+  fp16: false
+
+# Logging
+logging:
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 1000
+  output_dir: "outputs"
+  wandb: false
+
+# System
+system:
+  num_workers: 4
+  seed: 42
+  device: "auto"
+
