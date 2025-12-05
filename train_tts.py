@@ -530,17 +530,60 @@ class TTSTrainer:
             json.dump(info, f, indent=2)
         
         # Log to W&B
-        if self.wandb_run and generated_paths:
+        if self.wandb_run:
             try:
                 import wandb
                 audio_logs = {}
+                
+                # Log generated samples
                 for i, path in enumerate(generated_paths):
-                    audio_logs[f"samples/sample_{i+1}"] = wandb.Audio(
+                    prompt = self.sample_prompts[i]
+                    caption = f"[spk {prompt['speaker_id']}] {prompt['text'][:80]}"
+                    audio_logs[f"samples/generated_{i+1}"] = wandb.Audio(
                         str(path),
                         sample_rate=mimi.sample_rate,
-                        caption=self.sample_prompts[i]["text"][:100],
+                        caption=caption,
                     )
+                
+                # Log ground truth on first generation (for comparison)
+                if self.global_step == self.args.sample_interval:
+                    for i, prompt in enumerate(self.sample_prompts):
+                        if prompt.get("has_gt"):
+                            gt_path = self.samples_dir / f"sample_{i+1}_ground_truth.wav"
+                            if gt_path.exists():
+                                caption = f"[GT] [spk {prompt['speaker_id']}] {prompt['text'][:80]}"
+                                audio_logs[f"samples/ground_truth_{i+1}"] = wandb.Audio(
+                                    str(gt_path),
+                                    sample_rate=mimi.sample_rate,
+                                    caption=caption,
+                                )
+                
+                # Log as a table for better organization
+                if generated_paths:
+                    columns = ["step", "sample_id", "speaker", "text", "pred_frames", "audio"]
+                    data = []
+                    for i, path in enumerate(generated_paths):
+                        prompt = self.sample_prompts[i]
+                        text_ids = prompt["text_ids"].unsqueeze(0).to(self.device)
+                        speaker_id_t = torch.tensor([prompt["speaker_id"]], device=self.device)
+                        text_mask = torch.ones_like(text_ids, dtype=torch.float)
+                        pred_frames = int(self.model.predict_length(text_ids, speaker_id_t, text_mask).item())
+                        
+                        data.append([
+                            self.global_step,
+                            i + 1,
+                            prompt["speaker_id"],
+                            prompt["text"][:100],
+                            pred_frames,
+                            wandb.Audio(str(path), sample_rate=mimi.sample_rate),
+                        ])
+                    
+                    table = wandb.Table(columns=columns, data=data)
+                    audio_logs["samples/table"] = table
+                
                 wandb.log(audio_logs, step=self.global_step)
+                print(f"   📤 Uploaded {len(generated_paths)} samples to W&B")
+                
             except Exception as e:
                 print(f"   ⚠️  W&B audio logging failed: {e}")
         
