@@ -58,13 +58,13 @@ The TTS TRM is a non-autoregressive text-to-speech model that converts text + sp
                     │              TTS TRM Model               │
                     └─────────────────────────────────────────┘
                                         │
-        ┌───────────────────────────────┼───────────────────────────────┐
-        │                               │                               │
-        ▼                               ▼                               ▼
-┌───────────────┐              ┌───────────────┐              ┌───────────────┐
-│  Text Encoder │              │ Speaker Embed │              │ Audio Decoder │
-│  (Transformer)│              │  (Embedding)  │              │    (TRM)      │
-└───────────────┘              └───────────────┘              └───────────────┘
+        ┌───────────────┬───────────────┼───────────────┬───────────────┐
+        │               │               │               │               │
+        ▼               ▼               ▼               ▼               ▼
+┌───────────────┐ ┌───────────┐ ┌───────────────┐ ┌───────────────┐ ┌─────────┐
+│  Text Encoder │ │  Speaker  │ │    Length     │ │ Audio Decoder │ │ Output  │
+│  (Transformer)│ │  Embed    │ │   Predictor   │ │    (TRM)      │ │  Head   │
+└───────────────┘ └───────────┘ └───────────────┘ └───────────────┘ └─────────┘
 ```
 
 ### Component Details
@@ -227,9 +227,67 @@ logits: [B, 32, T_audio, 2048]            # All codebook predictions
 
 Example:
   Text: "Hello" (5 chars)
-  Estimated frames: 5 × 3 = 15 frames
+  Predicted frames: ~15 frames (learned)
   Audio duration: 15 / 12.5 = 1.2 seconds
   Total tokens: 15 × 32 = 480 tokens
+```
+
+---
+
+## Length Prediction
+
+The model includes a **learned length predictor** that estimates the number of audio frames from the text input.
+
+### Architecture
+
+```
+text_ctx: [B, T_text, D]          # Text encoding + speaker
+    │
+    ▼ Attention Pooling
+    │   attn_weights = softmax(MLP(text_ctx))   # [B, T_text]
+    │   pooled = sum(attn_weights * text_ctx)    # [B, D]
+    │
+    ▼ Prediction MLP
+    │   Linear(D, H) → ReLU → Dropout
+    │   Linear(H, H/2) → ReLU → Dropout
+    │   Linear(H/2, 1) → Softplus
+    │
+    ▼
+predicted_frames: [B]             # Continuous positive value
+```
+
+### Training
+
+During training, a **length prediction loss** is added:
+
+```python
+length_loss = MSE(log(predicted + 1), log(target + 1))
+total_loss = token_loss + 0.1 * length_loss
+```
+
+The log-scale loss helps with the wide range of possible durations.
+
+### Usage
+
+```python
+# Predict length explicitly
+predicted_frames = model.predict_length(text_ids, speaker_id, text_mask)
+
+# Or let generate() use predicted length automatically
+tokens = model.generate(
+    text_ids, speaker_id,
+    num_frames=None,  # Uses predicted length
+    ...
+)
+```
+
+### Metrics
+
+During validation, the model reports **Length MAE** (Mean Absolute Error in frames):
+
+```
+Validation Loss: 2.3456
+  Length MAE: 12.3 frames  # Average prediction error
 ```
 
 ---
@@ -535,6 +593,8 @@ python train_tts.py [OPTIONS]
 | `--num-heads` | `8` | Attention heads |
 | `--share-output-heads` | `False` | Share projection across codebooks |
 
+*(Note: `length_loss_weight` is set in TTSTRMConfig, default 0.1)*
+
 #### Training Options
 
 | Argument | Default | Description |
@@ -643,6 +703,10 @@ Text Encoder:
 Speaker Embedding:
   - Embedding:                     11 × 64 = 704
   - Projection:                    64 × 256 = 16,384
+
+Length Predictor:
+  - Attention Pool:                256 × 64 + 64 × 1 ≈ 16K
+  - Prediction MLP:                256 × 512 + 512 × 256 + 256 × 1 ≈ 262K
 
 Audio Decoder:
   - Init y, z:                     2 × 256 = 512

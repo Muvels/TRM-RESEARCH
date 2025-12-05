@@ -50,6 +50,9 @@ class TTSTRMConfig:
     share_output_heads: bool = False  # If True, use single head with codebook conditioning
     codebook_loss_weights: Optional[List[float]] = None  # Per-codebook loss weights
     
+    # Length prediction
+    length_loss_weight: float = 0.1  # Weight for duration prediction loss
+    
     # General
     num_heads: int = 8
     dropout: float = 0.1
@@ -134,6 +137,72 @@ class TextEncoder(nn.Module):
         
         x = self.encoder(x, src_key_padding_mask=key_padding_mask)
         return self.ln(x)
+
+
+class LengthPredictor(nn.Module):
+    """
+    Predicts the number of audio frames from text encoding.
+    
+    Uses attention pooling over text positions followed by an MLP
+    to predict a scalar (number of frames).
+    """
+    
+    def __init__(self, config: TTSTRMConfig):
+        super().__init__()
+        self.config = config
+        
+        # Attention pooling - learn to weight text positions
+        self.attn_pool = nn.Sequential(
+            nn.Linear(config.audio_embed_dim, config.audio_embed_dim // 4),
+            nn.Tanh(),
+            nn.Linear(config.audio_embed_dim // 4, 1),
+        )
+        
+        # Prediction head
+        self.predictor = nn.Sequential(
+            nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.audio_hidden_dim, config.audio_hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.audio_hidden_dim // 2, 1),
+        )
+    
+    def forward(
+        self,
+        text_ctx: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Predict number of audio frames.
+        
+        Args:
+            text_ctx: Text context [B, T_text, D] (already includes speaker info)
+            text_mask: [B, T_text] attention mask (1=valid, 0=padding)
+        
+        Returns:
+            predicted_frames: [B] predicted number of frames (continuous)
+        """
+        # Compute attention weights
+        attn_logits = self.attn_pool(text_ctx).squeeze(-1)  # [B, T_text]
+        
+        # Mask padding positions
+        if text_mask is not None:
+            attn_logits = attn_logits.masked_fill(text_mask == 0, float("-inf"))
+        
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, T_text]
+        
+        # Weighted sum
+        pooled = torch.einsum("bt,btd->bd", attn_weights, text_ctx)  # [B, D]
+        
+        # Predict frames
+        predicted_frames = self.predictor(pooled).squeeze(-1)  # [B]
+        
+        # Ensure positive with softplus
+        predicted_frames = F.softplus(predicted_frames)
+        
+        return predicted_frames
 
 
 class RecursiveBlock(nn.Module):
@@ -378,13 +447,8 @@ class TTSTRM(nn.Module):
         self.speaker_embed = nn.Embedding(config.num_speakers + 1, config.speaker_embed_dim)
         self.speaker_proj = nn.Linear(config.speaker_embed_dim, config.audio_embed_dim)
         
-        # Duration predictor (predict audio length from text)
-        self.duration_predictor = nn.Sequential(
-            nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.audio_hidden_dim, 1),
-            nn.Softplus(),  # Ensure positive
-        )
+        # Length predictor (predict audio frames from text + speaker)
+        self.length_predictor = LengthPredictor(config)
         
         # Learnable initial audio prediction
         self.init_y = nn.Parameter(torch.randn(1, 1, config.audio_embed_dim) * 0.02)
@@ -493,14 +557,21 @@ class TTSTRM(nn.Module):
         speaker_emb = self.speaker_proj(speaker_emb)  # [B, D_audio]
         text_ctx = text_ctx + speaker_emb.unsqueeze(1)  # [B, T_text, D]
         
-        # Determine audio length
+        # Predict audio length
+        predicted_frames = self.length_predictor(text_ctx, text_mask)  # [B]
+        
+        # Determine audio length to use
         if target_audio_tokens is not None:
             T_audio = target_audio_tokens.size(-1)
+            target_length = torch.full((B,), T_audio, device=device, dtype=torch.float)
         elif target_audio_frames is not None:
             T_audio = target_audio_frames
+            target_length = None
         else:
-            # Predict from text (rough estimate: ~3 frames per character)
-            T_audio = min(text_ids.size(1) * 3, self.config.max_audio_frames)
+            # Use predicted length (rounded, clamped)
+            T_audio = int(predicted_frames.mean().item())
+            T_audio = max(1, min(T_audio, self.config.max_audio_frames))
+            target_length = None
         
         # Initialize y and z
         y = self.init_y.expand(B, T_audio, -1).clone()
@@ -535,9 +606,19 @@ class TTSTRM(nn.Module):
         # Compute loss across all codebooks
         loss = None
         if target_audio_tokens is not None:
-            loss = self._compute_multi_codebook_loss(
+            # Token prediction loss
+            token_loss = self._compute_multi_codebook_loss(
                 all_logits, target_audio_tokens, return_all_steps, device
             )
+            
+            # Length prediction loss (MSE on log scale for stability)
+            length_loss = F.mse_loss(
+                torch.log(predicted_frames + 1),
+                torch.log(target_length + 1),
+            )
+            
+            # Combined loss
+            loss = token_loss + self.config.length_loss_weight * length_loss
         
         return logits, loss
     
@@ -602,6 +683,38 @@ class TTSTRM(nn.Module):
         return loss
     
     @torch.no_grad()
+    def predict_length(
+        self,
+        text_ids: torch.Tensor,
+        speaker_id: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Predict audio length in frames from text.
+        
+        Args:
+            text_ids: [B, T_text] text tokens
+            speaker_id: [B] speaker indices
+            text_mask: Text attention mask
+        
+        Returns:
+            predicted_frames: [B] predicted number of frames
+        """
+        # Encode text
+        text_enc = self.text_encoder(text_ids, text_mask)
+        text_ctx = self.text_proj(text_enc)
+        
+        # Add speaker
+        speaker_emb = self.speaker_embed(speaker_id)
+        speaker_emb = self.speaker_proj(speaker_emb)
+        text_ctx = text_ctx + speaker_emb.unsqueeze(1)
+        
+        # Predict length
+        predicted_frames = self.length_predictor(text_ctx, text_mask)
+        
+        return predicted_frames
+    
+    @torch.no_grad()
     def generate(
         self,
         text_ids: torch.Tensor,
@@ -618,7 +731,7 @@ class TTSTRM(nn.Module):
         Args:
             text_ids: [B, T_text] text tokens
             speaker_id: [B] speaker indices
-            num_frames: Number of audio frames to generate
+            num_frames: Number of audio frames to generate (None = use predicted length)
             text_mask: Text attention mask
             temperature: Sampling temperature (can be float or list per codebook)
             top_k: Top-k sampling
@@ -629,8 +742,12 @@ class TTSTRM(nn.Module):
         """
         self.eval()
         
+        # Use predicted length if not specified
         if num_frames is None:
-            num_frames = min(text_ids.size(1) * 3, self.config.max_audio_frames)
+            predicted = self.predict_length(text_ids, speaker_id, text_mask)
+            # Use mean of batch, round, and clamp
+            num_frames = int(predicted.mean().item())
+            num_frames = max(1, min(num_frames, self.config.max_audio_frames))
         
         # Forward pass
         logits, _ = self.forward(

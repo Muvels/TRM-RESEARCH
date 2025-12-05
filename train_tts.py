@@ -266,11 +266,15 @@ class TTSTrainer:
         codebook_correct = torch.zeros(num_codebooks, device=self.device)
         codebook_total = torch.zeros(num_codebooks, device=self.device)
         
+        # Track length prediction metrics
+        length_errors = []
+        
         for batch in tqdm(self.val_dataloader, desc="Evaluating"):
             text_ids = batch["text_ids"].to(self.device)
             speaker_id = batch["speaker_id"].to(self.device)
             audio_tokens = batch["audio_tokens"].to(self.device)
             text_mask = batch["text_mask"].to(self.device)
+            actual_frames = batch["num_audio_frames"].to(self.device)
             
             logits, loss = self.model(
                 text_ids=text_ids,
@@ -293,6 +297,11 @@ class TTSTrainer:
                 mask = target_c != 0
                 codebook_correct[c] += ((pred_c == target_c) & mask).sum()
                 codebook_total[c] += mask.sum()
+            
+            # Compute length prediction error
+            predicted_frames = self.model.predict_length(text_ids, speaker_id, text_mask)
+            length_error = (predicted_frames - actual_frames.float()).abs()
+            length_errors.append(length_error)
         
         avg_loss = total_loss / max(num_batches, 1)
         
@@ -302,10 +311,15 @@ class TTSTrainer:
         acoustic_acc = codebook_acc[1:].mean().item()
         overall_acc = codebook_acc.mean().item()
         
+        # Compute length metrics
+        all_length_errors = torch.cat(length_errors)
+        mae_frames = all_length_errors.mean().item()
+        
         print(f"\nValidation Loss: {avg_loss:.4f}")
         print(f"  Semantic (CB0) Accuracy: {semantic_acc:.2%}")
         print(f"  Acoustic (CB1-31) Accuracy: {acoustic_acc:.2%}")
         print(f"  Overall Accuracy: {overall_acc:.2%}")
+        print(f"  Length MAE: {mae_frames:.1f} frames")
         
         if self.wandb_run:
             import wandb
@@ -314,6 +328,7 @@ class TTSTrainer:
                 "val/semantic_acc": semantic_acc,
                 "val/acoustic_acc": acoustic_acc,
                 "val/overall_acc": overall_acc,
+                "val/length_mae": mae_frames,
                 "val/step": self.global_step,
             }
             # Log per-codebook accuracies
@@ -441,16 +456,21 @@ class TTSTrainer:
             # Prepare input
             text_ids = prompt["text_ids"].unsqueeze(0).to(self.device)
             speaker_id = torch.tensor([prompt["speaker_id"]], device=self.device)
-            num_frames = prompt["num_frames"]
+            target_frames = prompt["num_frames"]
             
             # Create text mask
             text_mask = torch.ones_like(text_ids, dtype=torch.float)
             
-            # Generate tokens
+            # Get predicted length
+            predicted_frames = self.model.predict_length(text_ids, speaker_id, text_mask)
+            pred_frames_int = int(predicted_frames.item())
+            pred_frames_int = max(1, min(pred_frames_int, self.model.config.max_audio_frames))
+            
+            # Use predicted length for generation (not target)
             tokens = self.model.generate(
                 text_ids=text_ids,
                 speaker_id=speaker_id,
-                num_frames=num_frames,
+                num_frames=None,  # Use predicted length
                 text_mask=text_mask,
                 temperature=self.args.sample_temperature,
                 top_k=self.args.sample_top_k,
@@ -476,20 +496,35 @@ class TTSTrainer:
                     sf.write(str(gt_path), gt_audio, mimi.sample_rate)
                 
                 text_preview = f"\"{prompt['text'][:30]}...\"" if len(prompt['text']) > 30 else f"\"{prompt['text']}\""
-                print(f"   ✓ Sample {i+1}: {text_preview} → {gen_path.name}")
+                length_info = f"({pred_frames_int} frames"
+                if prompt.get("has_gt"):
+                    length_info += f", target: {target_frames})"
+                else:
+                    length_info += ")"
+                print(f"   ✓ Sample {i+1}: {text_preview} {length_info} → {gen_path.name}")
                 
             except Exception as e:
                 print(f"   ✗ Sample {i+1} failed: {e}")
         
-        # Save sample info
+        # Save sample info with predicted lengths
+        sample_info = []
+        for p in self.sample_prompts:
+            text_ids = p["text_ids"].unsqueeze(0).to(self.device)
+            speaker_id = torch.tensor([p["speaker_id"]], device=self.device)
+            text_mask = torch.ones_like(text_ids, dtype=torch.float)
+            pred_len = int(self.model.predict_length(text_ids, speaker_id, text_mask).item())
+            sample_info.append({
+                "text": p["text"],
+                "speaker_id": p["speaker_id"],
+                "predicted_frames": pred_len,
+                "target_frames": p["num_frames"] if p.get("has_gt") else None,
+            })
+        
         info = {
             "step": self.global_step,
             "temperature": self.args.sample_temperature,
             "top_k": self.args.sample_top_k,
-            "prompts": [
-                {"text": p["text"], "speaker_id": p["speaker_id"]}
-                for p in self.sample_prompts
-            ],
+            "prompts": sample_info,
         }
         with open(step_dir / "info.json", "w") as f:
             json.dump(info, f, indent=2)
