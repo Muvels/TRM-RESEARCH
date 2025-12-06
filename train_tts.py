@@ -73,6 +73,8 @@ def parse_args():
     # Logging
     parser.add_argument("--log-interval", type=int, default=10, help="Log every N steps")
     parser.add_argument("--eval-interval", type=int, default=500, help="Eval every N steps")
+    parser.add_argument("--max-eval-batches", type=int, default=500, 
+                        help="Max batches for evaluation (0 = all, default 500)")
     parser.add_argument("--save-interval", type=int, default=1000, help="Save every N steps")
     parser.add_argument("--max-checkpoints", type=int, default=50, 
                         help="Max checkpoint files to keep (oldest deleted when exceeded, 0=unlimited)")
@@ -279,7 +281,13 @@ class TTSTrainer:
         # Track length prediction metrics
         length_errors = []
         
-        for batch in tqdm(self.val_dataloader, desc="Evaluating"):
+        # Limit evaluation batches
+        max_batches = self.args.max_eval_batches if self.args.max_eval_batches > 0 else float('inf')
+        total_val_batches = len(self.val_dataloader)
+        eval_batches = min(max_batches, total_val_batches)
+        
+        pbar = tqdm(self.val_dataloader, desc="Evaluating", total=eval_batches)
+        for batch in pbar:
             text_ids = batch["text_ids"].to(self.device)
             speaker_id = batch["speaker_id"].to(self.device)
             audio_tokens = batch["audio_tokens"].to(self.device)
@@ -312,6 +320,12 @@ class TTSTrainer:
             predicted_frames = self.model.predict_length(text_ids, speaker_id, text_mask)
             length_error = (predicted_frames - actual_frames.float()).abs()
             length_errors.append(length_error)
+            
+            # Stop if we've reached max batches
+            if num_batches >= max_batches:
+                break
+        
+        pbar.close()
         
         avg_loss = total_loss / max(num_batches, 1)
         
