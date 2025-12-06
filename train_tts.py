@@ -829,8 +829,11 @@ def main():
     print("\n📊 Codebook loss weights:")
     weights = model.get_codebook_weights()
     print(f"   Semantic (CB0): {weights[0]:.2f}")
-    print(f"   Early acoustic (CB1-7): {weights[1:8].mean():.2f} avg")
-    print(f"   Late acoustic (CB8-31): {weights[8:].mean():.2f} avg")
+    if num_codebooks > 1:
+        early_end = min(8, num_codebooks)
+        print(f"   Early acoustic (CB1-{early_end-1}): {weights[1:early_end].mean():.2f} avg")
+    if num_codebooks > 8:
+        print(f"   Late acoustic (CB8-{num_codebooks-1}): {weights[8:].mean():.2f} avg")
     
     # Train
     print(f"\n🚀 Starting TTS training for {args.epochs} epochs...")

@@ -282,6 +282,7 @@ class LengthPredictor(nn.Module):
                 nn.Dropout(config.dropout),
                 nn.Linear(config.audio_hidden_dim // 2, 1),
             )
+        
     
     def forward(
         self,
@@ -313,7 +314,7 @@ class LengthPredictor(nn.Module):
         # Predict frames
         predicted_frames = self.predictor(pooled).squeeze(-1)  # [B]
         
-        # Ensure positive with softplus
+        # Ensure positive with softplus (smooth ReLU)
         predicted_frames = F.softplus(predicted_frames)
         
         return predicted_frames
@@ -639,14 +640,27 @@ class TTSTRM(nn.Module):
     
     def _init_weights(self):
         """Initialize weights with truncated normal distribution."""
-        for module in self.modules():
+        for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 trunc_normal_init_(module.weight, std=1.0 / (module.in_features ** 0.5))
                 if module.bias is not None:
+                    # Don't reset length predictor's final bias (it's specially initialized)
+                    if "length_predictor.predictor" in name and name.endswith(".6"):
+                        continue  # Keep the special init
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 if module is not self.speaker_embed and module is not self.output_head.codebook_embed:
                     trunc_normal_init_(module.weight, std=0.02)
+        
+        # Re-initialize length predictor's final layer for reasonable initial predictions
+        # For softplus, large x → softplus(x) ≈ x, so bias of 100 gives ~100 frames
+        with torch.no_grad():
+            final_layer = self.length_predictor.predictor[-1]
+            if hasattr(final_layer, 'weight'):
+                # Make weights small so bias dominates initially
+                final_layer.weight.mul_(0.01)
+            if hasattr(final_layer, 'bias') and final_layer.bias is not None:
+                final_layer.bias.fill_(100.0)  # Start predicting ~100 frames
     
     def _recursive_forward(
         self,
