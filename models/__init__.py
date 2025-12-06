@@ -2,7 +2,8 @@
 from .trm import TRM, TRMConfig
 from .tts_trm import TTSTRM, TTSTRMConfig
 from .mimi_wrapper import MimiEncoder
+from .ema import EMAHelper
 
-__all__ = ["TRM", "TRMConfig", "TTSTRM", "TTSTRMConfig", "MimiEncoder"]
+__all__ = ["TRM", "TRMConfig", "TTSTRM", "TTSTRMConfig", "MimiEncoder", "EMAHelper"]
 
 

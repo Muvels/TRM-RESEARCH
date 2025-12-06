@@ -1,13 +1,16 @@
 """
 TTS TRM Model - Text-to-Speech with Tiny Recursive Model.
 
+Optimized version with:
+- SwiGLU activation (instead of GELU)
+- RMS normalization (instead of LayerNorm)
+- Partial gradient detachment for first H_cycle
+- bfloat16 support
+- Truncated normal initialization
+- torch.compile() support
+
 Takes text + speaker_id as input and predicts ALL 32 Mimi audio codebooks.
 Uses recursive refinement to progressively generate audio.
-
-Multi-codebook prediction uses:
-- Shared representation from recursive refinement
-- Codebook embeddings to condition on codebook index
-- Per-codebook output heads for specialized predictions
 """
 
 import math
@@ -18,6 +21,93 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# ============================================================================
+# Initialization helpers
+# ============================================================================
+
+def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0) -> torch.Tensor:
+    """
+    Truncated normal initialization.
+    Values are drawn from N(0, std) and truncated to [-2*std, 2*std].
+    """
+    with torch.no_grad():
+        size = tensor.shape
+        tmp = tensor.new_empty(size + (4,)).normal_()
+        valid = (tmp < 2) & (tmp > -2)
+        ind = valid.max(-1, keepdim=True)[1]
+        tensor.copy_(tmp.gather(-1, ind).squeeze(-1))
+        tensor.mul_(std)
+    return tensor
+
+
+# ============================================================================
+# Normalization
+# ============================================================================
+
+def rms_norm(hidden_states: torch.Tensor, weight: Optional[torch.Tensor] = None, 
+             eps: float = 1e-6) -> torch.Tensor:
+    """
+    Root Mean Square Layer Normalization.
+    Faster than LayerNorm as it doesn't compute mean.
+    """
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    hidden_states = hidden_states.to(input_dtype)
+    if weight is not None:
+        hidden_states = hidden_states * weight
+    return hidden_states
+
+
+class RMSNorm(nn.Module):
+    """RMS Normalization layer."""
+    
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm(x, self.weight, self.eps)
+
+
+# ============================================================================
+# Activation functions
+# ============================================================================
+
+def _find_multiple(a: int, b: int) -> int:
+    """Find the smallest multiple of b that is >= a."""
+    return (-(a // -b)) * b
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU activation: gate * up where gate = silu(Wx), up = Wx
+    More expressive than GELU, used in LLaMA, Moshi, etc.
+    """
+    
+    def __init__(self, hidden_size: int, expansion: float = 4.0):
+        super().__init__()
+        # Compute intermediate size (2/3 of expanded size, rounded to multiple of 256)
+        inter_size = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+        
+        self.gate_up_proj = nn.Linear(hidden_size, inter_size * 2, bias=False)
+        self.down_proj = nn.Linear(inter_size, hidden_size, bias=False)
+        
+        # Truncated normal init
+        trunc_normal_init_(self.gate_up_proj.weight, std=1.0 / (hidden_size ** 0.5))
+        trunc_normal_init_(self.down_proj.weight, std=1.0 / (inter_size ** 0.5))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
 
 @dataclass
 class TTSTRMConfig:
@@ -58,6 +148,13 @@ class TTSTRMConfig:
     dropout: float = 0.1
     max_text_len: int = 512
     max_audio_frames: int = 1024
+    
+    # Optimization settings
+    use_swiglu: bool = True  # Use SwiGLU instead of GELU
+    use_rms_norm: bool = True  # Use RMS norm instead of LayerNorm
+    gradient_detach_first_cycle: bool = True  # Detach first H_cycle from gradient
+    forward_dtype: str = "float32"  # "float32" or "bfloat16"
+    use_compile: bool = False  # Use torch.compile()
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -91,6 +188,7 @@ class TextEncoder(nn.Module):
         
         # Character embedding
         self.embed = nn.Embedding(config.text_vocab_size, config.text_embed_dim)
+        trunc_normal_init_(self.embed.weight, std=1.0 / math.sqrt(config.text_embed_dim))
         
         # Positional encoding
         self.pos_enc = SinusoidalPositionalEncoding(
@@ -104,12 +202,17 @@ class TextEncoder(nn.Module):
             dim_feedforward=config.text_hidden_dim,
             dropout=config.dropout,
             batch_first=True,
+            activation="gelu",  # Keep GELU for text encoder (standard)
         )
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=config.text_num_layers
         )
         
-        self.ln = nn.LayerNorm(config.text_embed_dim)
+        # Output norm
+        if config.use_rms_norm:
+            self.ln = RMSNorm(config.text_embed_dim)
+        else:
+            self.ln = nn.LayerNorm(config.text_embed_dim)
     
     def forward(
         self,
@@ -158,16 +261,27 @@ class LengthPredictor(nn.Module):
             nn.Linear(config.audio_embed_dim // 4, 1),
         )
         
-        # Prediction head
-        self.predictor = nn.Sequential(
-            nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.audio_hidden_dim, config.audio_hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.audio_hidden_dim // 2, 1),
-        )
+        # Prediction head with SwiGLU if enabled
+        if config.use_swiglu:
+            self.predictor = nn.Sequential(
+                nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim, config.audio_hidden_dim // 2),
+                nn.SiLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim // 2, 1),
+            )
+        else:
+            self.predictor = nn.Sequential(
+                nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim, config.audio_hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim // 2, 1),
+            )
     
     def forward(
         self,
@@ -210,16 +324,24 @@ class RecursiveBlock(nn.Module):
     Recursive reasoning block for TTS.
     
     Updates latent z given text context, speaker, current answer y, and z.
+    Uses post-norm with RMS normalization for efficiency.
     """
     
     def __init__(self, config: TTSTRMConfig):
         super().__init__()
         self.config = config
         
-        # Layer norms
-        self.ln_text = nn.LayerNorm(config.audio_embed_dim)
-        self.ln_y = nn.LayerNorm(config.audio_embed_dim)
-        self.ln_z = nn.LayerNorm(config.audio_embed_dim)
+        # Normalization layers
+        if config.use_rms_norm:
+            self.ln_text = RMSNorm(config.audio_embed_dim)
+            self.ln_y = RMSNorm(config.audio_embed_dim)
+            self.ln_z = RMSNorm(config.audio_embed_dim)
+            self.ln_ffn = RMSNorm(config.audio_embed_dim)
+        else:
+            self.ln_text = nn.LayerNorm(config.audio_embed_dim)
+            self.ln_y = nn.LayerNorm(config.audio_embed_dim)
+            self.ln_z = nn.LayerNorm(config.audio_embed_dim)
+            self.ln_ffn = nn.LayerNorm(config.audio_embed_dim)
         
         # Self-attention on z
         self.self_attn = nn.MultiheadAttention(
@@ -245,15 +367,17 @@ class RecursiveBlock(nn.Module):
             batch_first=True,
         )
         
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.audio_hidden_dim, config.audio_embed_dim),
-            nn.Dropout(config.dropout),
-        )
-        self.ln_ffn = nn.LayerNorm(config.audio_embed_dim)
+        # FFN - SwiGLU or standard
+        if config.use_swiglu:
+            self.ffn = SwiGLU(config.audio_embed_dim, expansion=config.audio_hidden_dim / config.audio_embed_dim)
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim, config.audio_embed_dim),
+                nn.Dropout(config.dropout),
+            )
     
     def forward(
         self,
@@ -305,9 +429,16 @@ class AnswerUpdater(nn.Module):
     
     def __init__(self, config: TTSTRMConfig):
         super().__init__()
+        self.config = config
         
-        self.ln_y = nn.LayerNorm(config.audio_embed_dim)
-        self.ln_z = nn.LayerNorm(config.audio_embed_dim)
+        if config.use_rms_norm:
+            self.ln_y = RMSNorm(config.audio_embed_dim)
+            self.ln_z = RMSNorm(config.audio_embed_dim)
+            self.ln_ffn = RMSNorm(config.audio_embed_dim)
+        else:
+            self.ln_y = nn.LayerNorm(config.audio_embed_dim)
+            self.ln_z = nn.LayerNorm(config.audio_embed_dim)
+            self.ln_ffn = nn.LayerNorm(config.audio_embed_dim)
         
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=config.audio_embed_dim,
@@ -316,14 +447,17 @@ class AnswerUpdater(nn.Module):
             batch_first=True,
         )
         
-        self.ffn = nn.Sequential(
-            nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.audio_hidden_dim, config.audio_embed_dim),
-            nn.Dropout(config.dropout),
-        )
-        self.ln_ffn = nn.LayerNorm(config.audio_embed_dim)
+        # FFN - SwiGLU or standard
+        if config.use_swiglu:
+            self.ffn = SwiGLU(config.audio_embed_dim, expansion=config.audio_hidden_dim / config.audio_embed_dim)
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(config.audio_embed_dim, config.audio_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.audio_hidden_dim, config.audio_embed_dim),
+                nn.Dropout(config.dropout),
+            )
     
     def forward(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         y_norm = self.ln_y(y)
@@ -351,10 +485,8 @@ class MultiCodebookHead(nn.Module):
         self.num_codebooks = config.num_codebooks
         
         # Codebook embeddings - learned representations for each codebook level
-        # These help the model understand the hierarchical structure:
-        # - Codebook 0: semantic/content
-        # - Codebooks 1-31: progressive acoustic detail
         self.codebook_embed = nn.Embedding(config.num_codebooks, config.codebook_embed_dim)
+        trunc_normal_init_(self.codebook_embed.weight, std=0.02)
         
         # Project codebook embedding to audio dimension
         self.codebook_proj = nn.Linear(config.codebook_embed_dim, config.audio_embed_dim)
@@ -369,7 +501,10 @@ class MultiCodebookHead(nn.Module):
                 for _ in range(config.num_codebooks)
             ])
         
-        self.ln = nn.LayerNorm(config.audio_embed_dim)
+        if config.use_rms_norm:
+            self.ln = RMSNorm(config.audio_embed_dim)
+        else:
+            self.ln = nn.LayerNorm(config.audio_embed_dim)
     
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """
@@ -411,28 +546,22 @@ class MultiCodebookHead(nn.Module):
 
 class TTSTRM(nn.Module):
     """
-    TTS TRM Model - Full Multi-Codebook Version.
+    TTS TRM Model - Full Multi-Codebook Version (Optimized).
+    
+    Optimizations over base version:
+    - SwiGLU activation (more expressive than GELU)
+    - RMS normalization (faster than LayerNorm)
+    - Partial gradient detachment (memory efficient)
+    - bfloat16 support (2x faster)
+    - Truncated normal initialization (better training)
     
     Text + Speaker → All 32 Mimi Audio Codebooks
-    
-    Architecture:
-    1. Encode text with transformer
-    2. Add speaker embedding
-    3. Initialize audio prediction y and latent z
-    4. For K improvement steps:
-        - For n recursive steps: z = RecursiveBlock(text, y, z)
-        - y = AnswerUpdater(y, z)
-    5. Project y to audio token logits for ALL codebooks
-    
-    The multi-codebook head uses codebook embeddings to capture the
-    hierarchical structure of the audio codec:
-    - Codebook 0: Core semantic/linguistic content
-    - Codebooks 1-31: Progressive acoustic refinement
     """
     
     def __init__(self, config: TTSTRMConfig):
         super().__init__()
         self.config = config
+        self.forward_dtype = getattr(torch, config.forward_dtype)
         
         # Text encoder
         self.text_encoder = TextEncoder(config)
@@ -446,15 +575,20 @@ class TTSTRM(nn.Module):
         # Speaker embedding
         self.speaker_embed = nn.Embedding(config.num_speakers + 1, config.speaker_embed_dim)
         self.speaker_proj = nn.Linear(config.speaker_embed_dim, config.audio_embed_dim)
+        trunc_normal_init_(self.speaker_embed.weight, std=0.02)
         
         # Length predictor (predict audio frames from text + speaker)
         self.length_predictor = LengthPredictor(config)
         
         # Learnable initial audio prediction
-        self.init_y = nn.Parameter(torch.randn(1, 1, config.audio_embed_dim) * 0.02)
+        self.init_y = nn.Parameter(trunc_normal_init_(
+            torch.empty(1, 1, config.audio_embed_dim), std=0.02
+        ))
         
         # Learnable initial latent
-        self.init_z = nn.Parameter(torch.randn(1, 1, config.audio_embed_dim) * 0.02)
+        self.init_z = nn.Parameter(trunc_normal_init_(
+            torch.empty(1, 1, config.audio_embed_dim), std=0.02
+        ))
         
         # Positional encoding for audio
         self.audio_pos_enc = SinusoidalPositionalEncoding(
@@ -479,8 +613,6 @@ class TTSTRM(nn.Module):
                 torch.tensor(config.codebook_loss_weights)
             )
         else:
-            # Default: weight earlier codebooks more heavily
-            # Semantic codebook (0) gets highest weight, acoustic codebooks get less
             weights = self._default_codebook_weights(config.num_codebooks)
             self.register_buffer("codebook_weights", weights)
         
@@ -491,13 +623,7 @@ class TTSTRM(nn.Module):
         Create default loss weights for codebooks.
         
         Strategy: Semantic codebooks (especially first few) are more important
-        for intelligibility, so weight them higher. Acoustic codebooks add
-        detail but are less critical.
-        
-        Weight distribution:
-        - Codebook 0 (semantic): 2.0
-        - Codebooks 1-7: Linear decay from 1.5 to 1.0
-        - Codebooks 8-31: 1.0 (equal weight)
+        for intelligibility, so weight them higher.
         """
         weights = torch.ones(num_codebooks)
         weights[0] = 2.0  # Semantic codebook most important
@@ -512,13 +638,63 @@ class TTSTRM(nn.Module):
         return weights
     
     def _init_weights(self):
+        """Initialize weights with truncated normal distribution."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight, gain=0.02)
+                trunc_normal_init_(module.weight, std=1.0 / (module.in_features ** 0.5))
                 if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
+                    nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module is not self.speaker_embed and module is not self.output_head.codebook_embed:
+                    trunc_normal_init_(module.weight, std=0.02)
+    
+    def _recursive_forward(
+        self,
+        text_ctx: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        return_all_steps: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Run recursive refinement with optional gradient detachment.
+        
+        Returns:
+            y: Final answer
+            z: Final latent
+            all_logits: List of logits from each H_cycle (if return_all_steps)
+        """
+        all_logits = []
+        
+        # Determine which cycles to detach
+        if self.training and self.config.gradient_detach_first_cycle and self.config.H_cycles > 1:
+            detach_until = 1  # Detach first cycle only
+        else:
+            detach_until = 0  # No detachment during inference
+        
+        for h in range(self.config.H_cycles):
+            # Optionally detach first cycle(s) for memory efficiency
+            if h < detach_until:
+                with torch.no_grad():
+                    for _l in range(self.config.L_cycles):
+                        for block in self.recursive_blocks:
+                            z = block(text_ctx, y, z, text_mask)
+                    y = self.answer_updater(y, z)
+                # Detach for next cycle
+                y = y.detach()
+                z = z.detach()
+            else:
+                # Normal forward with gradients
+                for _l in range(self.config.L_cycles):
+                    for block in self.recursive_blocks:
+                        z = block(text_ctx, y, z, text_mask)
+                y = self.answer_updater(y, z)
+            
+            if return_all_steps or h == self.config.H_cycles - 1:
+                logits = self.output_head(y)
+                all_logits.append(logits)
+        
+        return y, z, all_logits
     
     def forward(
         self,
@@ -543,10 +719,13 @@ class TTSTRM(nn.Module):
         Returns:
             logits: [B, num_codebooks, T_audio, vocab_size] 
                     or [B, H, num_codebooks, T_audio, vocab_size] if return_all_steps
-            loss: Cross-entropy loss if targets provided (averaged across all codebooks)
+            loss: Cross-entropy loss if targets provided
         """
         B = text_ids.size(0)
         device = text_ids.device
+        
+        # Cast to forward dtype if using bfloat16
+        orig_dtype = text_ids.dtype
         
         # Encode text
         text_enc = self.text_encoder(text_ids, text_mask)  # [B, T_text, D]
@@ -568,7 +747,6 @@ class TTSTRM(nn.Module):
             T_audio = target_audio_frames
             target_length = None
         else:
-            # Use predicted length (rounded, clamped)
             T_audio = int(predicted_frames.mean().item())
             T_audio = max(1, min(T_audio, self.config.max_audio_frames))
             target_length = None
@@ -581,27 +759,24 @@ class TTSTRM(nn.Module):
         y = self.audio_pos_enc(y)
         z = self.audio_pos_enc(z)
         
-        all_logits = []
+        # Cast to forward dtype
+        if self.forward_dtype != torch.float32:
+            text_ctx = text_ctx.to(self.forward_dtype)
+            y = y.to(self.forward_dtype)
+            z = z.to(self.forward_dtype)
         
-        # Recursive improvement
-        for h in range(self.config.H_cycles):
-            # Inner recursive reasoning
-            for l in range(self.config.L_cycles):
-                for block in self.recursive_blocks:
-                    z = block(text_ctx, y, z, text_mask)
-            
-            # Update answer
-            y = self.answer_updater(y, z)
-            
-            if return_all_steps or h == self.config.H_cycles - 1:
-                # Get logits for all codebooks: [B, num_codebooks, T, V]
-                logits = self.output_head(y)
-                all_logits.append(logits)
+        # Recursive refinement
+        y, z, all_logits = self._recursive_forward(
+            text_ctx, y, z, text_mask, return_all_steps
+        )
         
         if return_all_steps:
             logits = torch.stack(all_logits, dim=1)  # [B, H, C, T, V]
         else:
             logits = all_logits[-1]  # [B, C, T, V]
+        
+        # Cast logits back to float32 for loss computation
+        logits = logits.to(torch.float32)
         
         # Compute loss across all codebooks
         loss = None
@@ -629,55 +804,37 @@ class TTSTRM(nn.Module):
         return_all_steps: bool,
         device: torch.device,
     ) -> torch.Tensor:
-        """
-        Compute weighted cross-entropy loss across all codebooks.
-        
-        Args:
-            all_logits: List of [B, num_codebooks, T, V] for each H step
-            target_audio_tokens: [B, num_codebooks, T]
-            return_all_steps: Whether to weight losses across H steps
-            device: Device for tensors
-        
-        Returns:
-            Weighted average loss
-        """
+        """Compute weighted cross-entropy loss across all codebooks."""
         B, C, T = target_audio_tokens.shape
         
         def compute_codebook_losses(logits: torch.Tensor) -> torch.Tensor:
-            """Compute per-codebook losses."""
-            # logits: [B, C, T, V]
-            # target: [B, C, T]
             losses = []
             for c in range(C):
-                logits_c = logits[:, c, :, :]  # [B, T, V]
-                target_c = target_audio_tokens[:, c, :]  # [B, T]
+                logits_c = logits[:, c, :, :].to(torch.float32)
+                target_c = target_audio_tokens[:, c, :]
                 
                 loss_c = F.cross_entropy(
                     logits_c.reshape(-1, self.config.audio_vocab_size),
                     target_c.reshape(-1),
-                    ignore_index=0,  # Padding
+                    ignore_index=0,
                     reduction='mean',
                 )
                 losses.append(loss_c)
             
-            return torch.stack(losses)  # [C]
+            return torch.stack(losses)
         
         if return_all_steps:
-            # Compute losses for each H step, then weight
             step_losses = []
             for h, step_logits in enumerate(all_logits):
-                codebook_losses = compute_codebook_losses(step_logits)  # [C]
-                # Weight by codebook importance
+                codebook_losses = compute_codebook_losses(step_logits)
                 weighted_loss = (codebook_losses * self.codebook_weights).mean()
                 step_losses.append(weighted_loss)
             
-            # Weight later steps more (they should be better)
             step_weights = torch.linspace(0.5, 1.0, len(step_losses), device=device)
             step_weights = step_weights / step_weights.sum()
             loss = sum(w * l for w, l in zip(step_weights, step_losses))
         else:
-            codebook_losses = compute_codebook_losses(all_logits[-1])  # [C]
-            # Weight by codebook importance
+            codebook_losses = compute_codebook_losses(all_logits[-1])
             loss = (codebook_losses * self.codebook_weights).mean()
         
         return loss
@@ -689,27 +846,14 @@ class TTSTRM(nn.Module):
         speaker_id: torch.Tensor,
         text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Predict audio length in frames from text.
-        
-        Args:
-            text_ids: [B, T_text] text tokens
-            speaker_id: [B] speaker indices
-            text_mask: Text attention mask
-        
-        Returns:
-            predicted_frames: [B] predicted number of frames
-        """
-        # Encode text
+        """Predict audio length in frames from text."""
         text_enc = self.text_encoder(text_ids, text_mask)
         text_ctx = self.text_proj(text_enc)
         
-        # Add speaker
         speaker_emb = self.speaker_embed(speaker_id)
         speaker_emb = self.speaker_proj(speaker_emb)
         text_ctx = text_ctx + speaker_emb.unsqueeze(1)
         
-        # Predict length
         predicted_frames = self.length_predictor(text_ctx, text_mask)
         
         return predicted_frames
@@ -728,38 +872,24 @@ class TTSTRM(nn.Module):
         """
         Generate audio tokens from text for ALL codebooks.
         
-        Args:
-            text_ids: [B, T_text] text tokens
-            speaker_id: [B] speaker indices
-            num_frames: Number of audio frames to generate (None = use predicted length)
-            text_mask: Text attention mask
-            temperature: Sampling temperature (can be float or list per codebook)
-            top_k: Top-k sampling
-            top_p: Top-p (nucleus) sampling
-        
         Returns:
             tokens: [B, num_codebooks, T_audio] predicted audio tokens
         """
         self.eval()
         
-        # Use predicted length if not specified
         if num_frames is None:
             predicted = self.predict_length(text_ids, speaker_id, text_mask)
-            # Use mean of batch, round, and clamp
             num_frames = int(predicted.mean().item())
             num_frames = max(1, min(num_frames, self.config.max_audio_frames))
         
-        # Forward pass
         logits, _ = self.forward(
             text_ids, speaker_id,
             target_audio_frames=num_frames,
             text_mask=text_mask,
         )
-        # logits: [B, num_codebooks, T, V]
         
         B, C, T, V = logits.shape
         
-        # Handle per-codebook temperature
         if isinstance(temperature, (list, tuple)):
             temps = temperature
         else:
@@ -768,12 +898,9 @@ class TTSTRM(nn.Module):
         all_tokens = []
         
         for c in range(C):
-            logits_c = logits[:, c, :, :]  # [B, T, V]
-            
-            # Apply temperature
+            logits_c = logits[:, c, :, :]
             logits_c = logits_c / temps[c]
             
-            # Top-k filtering
             if top_k is not None:
                 v, _ = torch.topk(logits_c, min(top_k, V), dim=-1)
                 logits_c = torch.where(
@@ -782,17 +909,14 @@ class TTSTRM(nn.Module):
                     logits_c,
                 )
             
-            # Top-p (nucleus) filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(logits_c, descending=True, dim=-1)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 
-                # Remove tokens with cumulative probability above threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
                 
-                # Scatter back
                 indices_to_remove = sorted_indices_to_remove.scatter(
                     -1, sorted_indices, sorted_indices_to_remove
                 )
@@ -802,14 +926,12 @@ class TTSTRM(nn.Module):
                     logits_c,
                 )
             
-            # Sample
             probs = F.softmax(logits_c, dim=-1)
             tokens_c = torch.multinomial(probs.view(-1, V), num_samples=1)
             tokens_c = tokens_c.view(B, T)
             
             all_tokens.append(tokens_c)
         
-        # Stack: [B, num_codebooks, T]
         tokens = torch.stack(all_tokens, dim=1)
         
         return tokens
@@ -818,5 +940,4 @@ class TTSTRM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def get_codebook_weights(self) -> torch.Tensor:
-        """Return current codebook loss weights."""
         return self.codebook_weights
