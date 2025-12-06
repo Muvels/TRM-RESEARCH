@@ -97,6 +97,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint (path to .pt file)")
     parser.add_argument("--fp16", action="store_true", help="Mixed precision (fp16)")
     
     # Logging
@@ -802,6 +804,29 @@ def main():
     print(f"   Output heads: {'shared' if args.share_output_heads else 'separate per codebook'}")
     if train_codebooks < num_codebooks:
         print(f"   ⚡ Training only on first {train_codebooks} codebook(s) (CB0{'-CB'+str(train_codebooks-1) if train_codebooks > 1 else ''})")
+    
+    # Load checkpoint if resuming
+    start_step = 0
+    if args.resume:
+        print(f"\n📥 Loading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        
+        # Load model weights (strict=False allows adding new codebook heads)
+        missing, unexpected = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if missing:
+            print(f"   ⚠️  Missing keys (expected when adding codebooks): {len(missing)}")
+        if unexpected:
+            print(f"   ⚠️  Unexpected keys: {len(unexpected)}")
+        
+        # Get previous training info
+        prev_step = checkpoint.get("global_step", 0)
+        prev_train_cb = checkpoint.get("config", {}).get("train_codebooks", num_codebooks)
+        print(f"   Loaded from step {prev_step}")
+        if prev_train_cb and prev_train_cb != train_codebooks:
+            print(f"   📈 Upgrading from {prev_train_cb} → {train_codebooks} codebooks")
+        
+        # Optionally restore step count (set to 0 for fresh start with more codebooks)
+        # start_step = prev_step  # Uncomment to continue step count
     
     # Setup EMA
     ema_helper = None
