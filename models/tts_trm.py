@@ -139,6 +139,7 @@ class TTSTRMConfig:
     codebook_embed_dim: int = 64  # Dimension for codebook embeddings
     share_output_heads: bool = False  # If True, use single head with codebook conditioning
     codebook_loss_weights: Optional[List[float]] = None  # Per-codebook loss weights
+    train_codebooks: Optional[int] = None  # Only train on first N codebooks (None = all)
     
     # Length prediction
     length_loss_weight: float = 0.1  # Weight for duration prediction loss
@@ -818,12 +819,16 @@ class TTSTRM(nn.Module):
         return_all_steps: bool,
         device: torch.device,
     ) -> torch.Tensor:
-        """Compute weighted cross-entropy loss across all codebooks."""
+        """Compute weighted cross-entropy loss across codebooks."""
         B, C, T = target_audio_tokens.shape
+        
+        # Determine how many codebooks to train on
+        train_cb = self.config.train_codebooks if self.config.train_codebooks else C
+        train_cb = min(train_cb, C)
         
         def compute_codebook_losses(logits: torch.Tensor) -> torch.Tensor:
             losses = []
-            for c in range(C):
+            for c in range(train_cb):  # Only train on first train_cb codebooks
                 logits_c = logits[:, c, :, :].to(torch.float32)
                 target_c = target_audio_tokens[:, c, :]
                 
@@ -837,11 +842,14 @@ class TTSTRM(nn.Module):
             
             return torch.stack(losses)
         
+        # Get weights for the codebooks we're training on
+        train_weights = self.codebook_weights[:train_cb]
+        
         if return_all_steps:
             step_losses = []
             for h, step_logits in enumerate(all_logits):
                 codebook_losses = compute_codebook_losses(step_logits)
-                weighted_loss = (codebook_losses * self.codebook_weights).mean()
+                weighted_loss = (codebook_losses * train_weights).mean()
                 step_losses.append(weighted_loss)
             
             step_weights = torch.linspace(0.5, 1.0, len(step_losses), device=device)
@@ -849,7 +857,7 @@ class TTSTRM(nn.Module):
             loss = sum(w * l for w, l in zip(step_weights, step_losses))
         else:
             codebook_losses = compute_codebook_losses(all_logits[-1])
-            loss = (codebook_losses * self.codebook_weights).mean()
+            loss = (codebook_losses * train_weights).mean()
         
         return loss
     

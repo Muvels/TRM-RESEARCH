@@ -58,6 +58,8 @@ def parse_args():
                         help="Dataset format: auto, local (.pt files), or hf_parquet")
     parser.add_argument("--num-codebooks", type=int, default=None,
                         help="Number of codebooks (None = auto-detect from dataset)")
+    parser.add_argument("--train-codebooks", type=int, default=None,
+                        help="Only train on first N codebooks (None = all). Use 1 to train CB0 only first.")
     
     # Model architecture
     parser.add_argument("--text-embed-dim", type=int, default=256, help="Text embedding dim")
@@ -755,6 +757,11 @@ def main():
     print(f"   Codebook size: {codebook_size}")
     
     # Create model with optimization flags
+    # Determine how many codebooks to train on
+    train_codebooks = args.train_codebooks if args.train_codebooks else num_codebooks
+    if train_codebooks > num_codebooks:
+        train_codebooks = num_codebooks
+    
     print("\n📦 Creating TTS TRM model (optimized)...")
     config = TTSTRMConfig(
         text_vocab_size=text_vocab_size,
@@ -767,6 +774,7 @@ def main():
         audio_hidden_dim=args.hidden_dim,
         audio_vocab_size=codebook_size,
         num_codebooks=num_codebooks,
+        train_codebooks=train_codebooks,  # Only train on first N codebooks
         L_layers=args.L_layers,
         H_cycles=args.H_cycles,
         L_cycles=args.L_cycles,
@@ -792,6 +800,8 @@ def main():
     num_params = model.count_parameters()
     print(f"   Parameters: {num_params:,} ({num_params / 1e6:.2f}M)")
     print(f"   Output heads: {'shared' if args.share_output_heads else 'separate per codebook'}")
+    if train_codebooks < num_codebooks:
+        print(f"   ⚡ Training only on first {train_codebooks} codebook(s) (CB0{'-CB'+str(train_codebooks-1) if train_codebooks > 1 else ''})")
     
     # Setup EMA
     ema_helper = None
@@ -828,12 +838,15 @@ def main():
     # Print codebook weights
     print("\n📊 Codebook loss weights:")
     weights = model.get_codebook_weights()
-    print(f"   Semantic (CB0): {weights[0]:.2f}")
-    if num_codebooks > 1:
-        early_end = min(8, num_codebooks)
-        print(f"   Early acoustic (CB1-{early_end-1}): {weights[1:early_end].mean():.2f} avg")
-    if num_codebooks > 8:
-        print(f"   Late acoustic (CB8-{num_codebooks-1}): {weights[8:].mean():.2f} avg")
+    if train_codebooks == 1:
+        print(f"   CB0 only: {weights[0]:.2f}")
+    else:
+        print(f"   Semantic (CB0): {weights[0]:.2f}")
+        if train_codebooks > 1:
+            early_end = min(8, train_codebooks)
+            print(f"   Early acoustic (CB1-{early_end-1}): {weights[1:early_end].mean():.2f} avg")
+        if train_codebooks > 8:
+            print(f"   Late acoustic (CB8-{train_codebooks-1}): {weights[8:train_codebooks].mean():.2f} avg")
     
     # Train
     print(f"\n🚀 Starting TTS training for {args.epochs} epochs...")
