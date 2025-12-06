@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=10, help="Log every N steps")
     parser.add_argument("--eval-interval", type=int, default=500, help="Eval every N steps")
     parser.add_argument("--save-interval", type=int, default=1000, help="Save every N steps")
+    parser.add_argument("--max-checkpoints", type=int, default=50, 
+                        help="Max checkpoint files to keep (oldest deleted when exceeded, 0=unlimited)")
     parser.add_argument("--output-dir", type=str, default="outputs/tts", help="Output directory")
     parser.add_argument("--run-name", type=str, default=None, help="Run name")
     parser.add_argument("--wandb", action="store_true", help="Use W&B")
@@ -615,6 +617,31 @@ class TTSTrainer:
         path = checkpoint_dir / f"{name}.pt"
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
+        
+        # Enforce max checkpoints limit
+        self._cleanup_old_checkpoints(checkpoint_dir)
+    
+    def _cleanup_old_checkpoints(self, checkpoint_dir: Path):
+        """Delete oldest checkpoints if we exceed the limit."""
+        max_ckpts = self.args.max_checkpoints
+        if max_ckpts <= 0:
+            return  # Unlimited
+        
+        # Get all step_*.pt checkpoints (exclude best.pt, final.pt)
+        step_checkpoints = sorted(
+            checkpoint_dir.glob("step_*.pt"),
+            key=lambda p: p.stat().st_mtime  # Sort by modification time
+        )
+        
+        # Delete oldest if over limit
+        num_to_delete = len(step_checkpoints) - max_ckpts
+        if num_to_delete > 0:
+            for ckpt in step_checkpoints[:num_to_delete]:
+                try:
+                    ckpt.unlink()
+                    print(f"   Deleted old checkpoint: {ckpt.name}")
+                except Exception as e:
+                    print(f"   Warning: Failed to delete {ckpt.name}: {e}")
 
 
 def main():
