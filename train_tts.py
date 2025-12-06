@@ -1,7 +1,15 @@
 """
-TTS Training Script for TRM.
+TTS Training Script for TRM (Optimized).
 
 Trains the TTS TRM model: text + speaker_id → mimi_tokens
+
+Optimizations:
+- SwiGLU activation (optional, default on)
+- RMS normalization (optional, default on)
+- Partial gradient detachment (optional, default on)
+- bfloat16 mixed precision (optional, default off)
+- EMA (Exponential Moving Average) support
+- torch.compile() support (optional)
 
 Supports multiple dataset formats:
 - local: Pre-tokenized .pt files (original format)
@@ -17,6 +25,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+import copy
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +34,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from models import TTSTRM, TTSTRMConfig
+from models import TTSTRM, TTSTRMConfig, EMAHelper
 from models.mimi_wrapper import MimiEncoder
 from dataset import TTSDataModule
 
@@ -37,7 +46,7 @@ except ImportError:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train TTS TRM model")
+    parser = argparse.ArgumentParser(description="Train TTS TRM model (Optimized)")
     
     # Data
     parser.add_argument("--data-dir", type=str, default="test_dataset", help="Data directory")
@@ -50,7 +59,7 @@ def parse_args():
     parser.add_argument("--num-codebooks", type=int, default=None,
                         help="Number of codebooks (None = auto-detect from dataset)")
     
-    # Model
+    # Model architecture
     parser.add_argument("--text-embed-dim", type=int, default=256, help="Text embedding dim")
     parser.add_argument("--audio-embed-dim", type=int, default=256, help="Audio embedding dim")
     parser.add_argument("--hidden-dim", type=int, default=512, help="Hidden dimension")
@@ -62,13 +71,31 @@ def parse_args():
     parser.add_argument("--share-output-heads", action="store_true", 
                         help="Share output projection across codebooks (fewer params)")
     
+    # Optimization flags (NEW)
+    parser.add_argument("--no-swiglu", action="store_true",
+                        help="Disable SwiGLU activation (use GELU instead)")
+    parser.add_argument("--no-rms-norm", action="store_true",
+                        help="Disable RMS normalization (use LayerNorm instead)")
+    parser.add_argument("--no-gradient-detach", action="store_true",
+                        help="Disable gradient detachment for first H_cycle")
+    parser.add_argument("--bfloat16", action="store_true",
+                        help="Use bfloat16 for forward pass (faster, slightly less precise)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile() for faster training (requires PyTorch 2.0+)")
+    
+    # EMA (NEW)
+    parser.add_argument("--ema", action="store_true",
+                        help="Use Exponential Moving Average for model weights")
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                        help="EMA decay rate (default: 0.999)")
+    
     # Training
     parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--fp16", action="store_true", help="Mixed precision")
+    parser.add_argument("--fp16", action="store_true", help="Mixed precision (fp16)")
     
     # Logging
     parser.add_argument("--log-interval", type=int, default=10, help="Log every N steps")
@@ -128,7 +155,7 @@ def get_device(device_arg: str) -> torch.device:
 
 
 class TTSTrainer:
-    """Trainer for TTS TRM model."""
+    """Trainer for TTS TRM model (Optimized)."""
     
     def __init__(
         self,
@@ -140,6 +167,7 @@ class TTSTrainer:
         args,
         device: torch.device,
         val_dataset=None,
+        ema_helper: Optional[EMAHelper] = None,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -149,6 +177,7 @@ class TTSTrainer:
         self.scheduler = scheduler
         self.args = args
         self.device = device
+        self.ema_helper = ema_helper
         
         self.scaler = GradScaler() if args.fp16 else None
         self.global_step = 0
@@ -187,6 +216,10 @@ class TTSTrainer:
             total_loss += loss
             num_batches += 1
             self.global_step += 1
+            
+            # Update EMA
+            if self.ema_helper is not None:
+                self.ema_helper.update(self.model)
             
             # Logging
             if self.global_step % self.args.log_interval == 0:
@@ -269,12 +302,20 @@ class TTSTrainer:
     
     @torch.no_grad()
     def evaluate(self) -> float:
-        self.model.eval()
+        # Use EMA model for evaluation if available
+        if self.ema_helper is not None:
+            eval_model = self.ema_helper.ema_copy(self.model)
+            eval_model.eval()
+            print("   (Using EMA model for evaluation)")
+        else:
+            eval_model = self.model
+            eval_model.eval()
+        
         total_loss = 0
         num_batches = 0
         
         # Track per-codebook metrics
-        num_codebooks = self.model.config.num_codebooks
+        num_codebooks = eval_model.config.num_codebooks
         codebook_correct = torch.zeros(num_codebooks, device=self.device)
         codebook_total = torch.zeros(num_codebooks, device=self.device)
         
@@ -294,38 +335,39 @@ class TTSTrainer:
             text_mask = batch["text_mask"].to(self.device)
             actual_frames = batch["num_audio_frames"].to(self.device)
             
-            logits, loss = self.model(
+            logits, loss = eval_model(
                 text_ids=text_ids,
                 speaker_id=speaker_id,
                 target_audio_tokens=audio_tokens,
                 text_mask=text_mask,
             )
-            # logits: [B, num_codebooks, T, V]
             
             total_loss += loss.item()
             num_batches += 1
             
             # Compute per-codebook accuracy
-            preds = logits.argmax(dim=-1)  # [B, num_codebooks, T]
+            preds = logits.argmax(dim=-1)
             for c in range(num_codebooks):
-                pred_c = preds[:, c, :]  # [B, T]
-                target_c = audio_tokens[:, c, :]  # [B, T]
+                pred_c = preds[:, c, :]
+                target_c = audio_tokens[:, c, :]
                 
-                # Ignore padding (token 0)
                 mask = target_c != 0
                 codebook_correct[c] += ((pred_c == target_c) & mask).sum()
                 codebook_total[c] += mask.sum()
             
             # Compute length prediction error
-            predicted_frames = self.model.predict_length(text_ids, speaker_id, text_mask)
+            predicted_frames = eval_model.predict_length(text_ids, speaker_id, text_mask)
             length_error = (predicted_frames - actual_frames.float()).abs()
             length_errors.append(length_error)
             
-            # Stop if we've reached max batches
             if num_batches >= max_batches:
                 break
         
         pbar.close()
+        
+        # Clean up EMA copy
+        if self.ema_helper is not None:
+            del eval_model
         
         avg_loss = total_loss / max(num_batches, 1)
         
@@ -355,8 +397,7 @@ class TTSTrainer:
                 "val/length_mae": mae_frames,
                 "val/step": self.global_step,
             }
-            # Log per-codebook accuracies
-            for c in range(min(8, num_codebooks)):  # Log first 8 codebooks
+            for c in range(min(8, num_codebooks)):
                 log_dict[f"val/codebook_{c}_acc"] = codebook_acc[c].item()
             wandb.log(log_dict)
         
@@ -377,13 +418,11 @@ class TTSTrainer:
         
         self.sample_prompts = []
         
-        # Option 1: Custom prompts from CLI
         if self.args.sample_prompts:
             print(f"📝 Using custom prompts from CLI:")
             for text in self.args.sample_prompts:
                 self._add_custom_prompt(text, self.args.sample_speaker)
         
-        # Option 2: Custom prompts from file
         elif self.args.sample_prompts_file:
             prompts_file = Path(self.args.sample_prompts_file)
             if prompts_file.exists():
@@ -393,7 +432,6 @@ class TTSTrainer:
                         line = line.strip()
                         if not line or line.startswith("#"):
                             continue
-                        # Format: "speaker_id|text" or just "text"
                         if "|" in line:
                             speaker_str, text = line.split("|", 1)
                             speaker_id = int(speaker_str.strip())
@@ -404,7 +442,6 @@ class TTSTrainer:
             else:
                 print(f"⚠️  Prompts file not found: {prompts_file}")
         
-        # Option 3: Fall back to dataset samples
         else:
             if self.val_dataset is None:
                 print("⚠️  No validation dataset available for sample generation")
@@ -420,11 +457,10 @@ class TTSTrainer:
                     "text_ids": sample["text_ids"],
                     "speaker_id": sample["speaker_id"],
                     "num_frames": sample["num_audio_frames"],
-                    "gt_tokens": sample["audio_tokens"],  # Ground truth for comparison
+                    "gt_tokens": sample["audio_tokens"],
                     "has_gt": True,
                 })
         
-        # Print prompts
         for i, p in enumerate(self.sample_prompts):
             text_preview = f"\"{p['text'][:50]}...\"" if len(p['text']) > 50 else f"\"{p['text']}\""
             gt_marker = " (has GT)" if p.get("has_gt") else ""
@@ -436,10 +472,7 @@ class TTSTrainer:
             print(f"⚠️  Cannot encode text without dataset vocabulary")
             return
         
-        # Encode text using the dataset's vocabulary
         text_ids = self.val_dataset.encode_text(text)
-        
-        # Estimate number of frames (~12.5 frames per second, ~3 chars per frame)
         num_frames = min(len(text) * 3, self.model.config.max_audio_frames)
         
         self.sample_prompts.append({
@@ -461,13 +494,20 @@ class TTSTrainer:
             print("⚠️  soundfile not installed, skipping sample generation")
             return
         
-        # Setup
         self._setup_sample_prompts()
         if not self.sample_prompts:
             return
         
         mimi = self._load_mimi()
-        self.model.eval()
+        
+        # Use EMA model for sample generation if available
+        if self.ema_helper is not None:
+            gen_model = self.ema_helper.ema_copy(self.model)
+            gen_model.eval()
+            print("   (Using EMA model for generation)")
+        else:
+            gen_model = self.model
+            gen_model.eval()
         
         step_dir = self.samples_dir / f"step_{self.global_step:06d}"
         step_dir.mkdir(exist_ok=True)
@@ -477,41 +517,33 @@ class TTSTrainer:
         generated_paths = []
         
         for i, prompt in enumerate(self.sample_prompts):
-            # Prepare input
             text_ids = prompt["text_ids"].unsqueeze(0).to(self.device)
             speaker_id = torch.tensor([prompt["speaker_id"]], device=self.device)
             target_frames = prompt["num_frames"]
             
-            # Create text mask
             text_mask = torch.ones_like(text_ids, dtype=torch.float)
             
-            # Get predicted length
-            predicted_frames = self.model.predict_length(text_ids, speaker_id, text_mask)
+            predicted_frames = gen_model.predict_length(text_ids, speaker_id, text_mask)
             pred_frames_int = int(predicted_frames.item())
-            pred_frames_int = max(1, min(pred_frames_int, self.model.config.max_audio_frames))
+            pred_frames_int = max(1, min(pred_frames_int, gen_model.config.max_audio_frames))
             
-            # Use predicted length for generation (not target)
-            tokens = self.model.generate(
+            tokens = gen_model.generate(
                 text_ids=text_ids,
                 speaker_id=speaker_id,
-                num_frames=None,  # Use predicted length
+                num_frames=None,
                 text_mask=text_mask,
                 temperature=self.args.sample_temperature,
                 top_k=self.args.sample_top_k,
             )
-            # tokens: [1, num_codebooks, T]
             
-            # Decode to audio
             try:
-                audio = mimi.decode(tokens)  # [1, 1, T_samples]
+                audio = mimi.decode(tokens)
                 audio = audio.squeeze().cpu().numpy()
                 
-                # Save generated audio
                 gen_path = step_dir / f"sample_{i+1}_generated.wav"
                 sf.write(str(gen_path), audio, mimi.sample_rate)
                 generated_paths.append(gen_path)
                 
-                # Also save ground truth on first generation for comparison (if available)
                 if self.global_step == self.args.sample_interval and prompt.get("has_gt") and prompt["gt_tokens"] is not None:
                     gt_tokens = prompt["gt_tokens"].unsqueeze(0).to(self.device)
                     gt_audio = mimi.decode(gt_tokens)
@@ -530,7 +562,11 @@ class TTSTrainer:
             except Exception as e:
                 print(f"   ✗ Sample {i+1} failed: {e}")
         
-        # Save sample info with predicted lengths
+        # Clean up EMA copy
+        if self.ema_helper is not None:
+            del gen_model
+        
+        # Save sample info
         sample_info = []
         for p in self.sample_prompts:
             text_ids = p["text_ids"].unsqueeze(0).to(self.device)
@@ -548,6 +584,7 @@ class TTSTrainer:
             "step": self.global_step,
             "temperature": self.args.sample_temperature,
             "top_k": self.args.sample_top_k,
+            "using_ema": self.ema_helper is not None,
             "prompts": sample_info,
         }
         with open(step_dir / "info.json", "w") as f:
@@ -559,7 +596,6 @@ class TTSTrainer:
                 import wandb
                 audio_logs = {}
                 
-                # Log generated samples
                 for i, path in enumerate(generated_paths):
                     prompt = self.sample_prompts[i]
                     caption = f"[spk {prompt['speaker_id']}] {prompt['text'][:80]}"
@@ -569,7 +605,6 @@ class TTSTrainer:
                         caption=caption,
                     )
                 
-                # Log ground truth on first generation (for comparison)
                 if self.global_step == self.args.sample_interval:
                     for i, prompt in enumerate(self.sample_prompts):
                         if prompt.get("has_gt"):
@@ -582,7 +617,6 @@ class TTSTrainer:
                                     caption=caption,
                                 )
                 
-                # Log as a table for better organization
                 if generated_paths:
                     columns = ["step", "sample_id", "speaker", "text", "pred_frames", "audio"]
                     data = []
@@ -628,26 +662,27 @@ class TTSTrainer:
             "args": vars(self.args),
         }
         
+        # Save EMA state if using
+        if self.ema_helper is not None:
+            checkpoint["ema_state_dict"] = self.ema_helper.state_dict()
+        
         path = checkpoint_dir / f"{name}.pt"
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
         
-        # Enforce max checkpoints limit
         self._cleanup_old_checkpoints(checkpoint_dir)
     
     def _cleanup_old_checkpoints(self, checkpoint_dir: Path):
         """Delete oldest checkpoints if we exceed the limit."""
         max_ckpts = self.args.max_checkpoints
         if max_ckpts <= 0:
-            return  # Unlimited
+            return
         
-        # Get all step_*.pt checkpoints (exclude best.pt, final.pt)
         step_checkpoints = sorted(
             checkpoint_dir.glob("step_*.pt"),
-            key=lambda p: p.stat().st_mtime  # Sort by modification time
+            key=lambda p: p.stat().st_mtime
         )
         
-        # Delete oldest if over limit
         num_to_delete = len(step_checkpoints) - max_ckpts
         if num_to_delete > 0:
             for ckpt in step_checkpoints[:num_to_delete]:
@@ -669,11 +704,19 @@ def main():
     num_workers = 0 if device.type == "mps" else args.num_workers
     pin_memory = device.type == "cuda"
     
+    # Print optimization settings
+    print("\n🚀 Optimization settings:")
+    print(f"   SwiGLU: {'disabled' if args.no_swiglu else 'enabled'}")
+    print(f"   RMS Norm: {'disabled' if args.no_rms_norm else 'enabled'}")
+    print(f"   Gradient Detach (1st cycle): {'disabled' if args.no_gradient_detach else 'enabled'}")
+    print(f"   bfloat16: {'enabled' if args.bfloat16 else 'disabled'}")
+    print(f"   torch.compile(): {'enabled' if args.compile else 'disabled'}")
+    print(f"   EMA: {'enabled' if args.ema else 'disabled'}")
+    
     # Setup data
     print("\n📁 Setting up TTS data...")
     token_dir = Path(args.token_dir) if args.token_dir else Path(args.data_dir) / "mimi_tokens"
     
-    # Check if data exists (different checks for different formats)
     data_path = Path(args.data_dir)
     has_parquet = list(data_path.glob("*.parquet"))
     has_local = token_dir.exists() and list(token_dir.rglob("*.pt"))
@@ -711,8 +754,8 @@ def main():
     print(f"   Codebooks: {num_codebooks}")
     print(f"   Codebook size: {codebook_size}")
     
-    # Create model
-    print("\n📦 Creating TTS TRM model (full multi-codebook)...")
+    # Create model with optimization flags
+    print("\n📦 Creating TTS TRM model (optimized)...")
     config = TTSTRMConfig(
         text_vocab_size=text_vocab_size,
         text_embed_dim=args.text_embed_dim,
@@ -731,13 +774,31 @@ def main():
         max_text_len=args.max_text_length,
         max_audio_frames=args.max_audio_frames,
         share_output_heads=args.share_output_heads,
+        # Optimization settings
+        use_swiglu=not args.no_swiglu,
+        use_rms_norm=not args.no_rms_norm,
+        gradient_detach_first_cycle=not args.no_gradient_detach,
+        forward_dtype="bfloat16" if args.bfloat16 else "float32",
+        use_compile=args.compile,
     )
     
     model = TTSTRM(config).to(device)
     
+    # Optionally compile model
+    if args.compile:
+        print("   Compiling model with torch.compile()...")
+        model = torch.compile(model)
+    
     num_params = model.count_parameters()
     print(f"   Parameters: {num_params:,} ({num_params / 1e6:.2f}M)")
     print(f"   Output heads: {'shared' if args.share_output_heads else 'separate per codebook'}")
+    
+    # Setup EMA
+    ema_helper = None
+    if args.ema:
+        print(f"   Setting up EMA with decay={args.ema_decay}")
+        ema_helper = EMAHelper(mu=args.ema_decay)
+        ema_helper.register(model)
     
     # Optimizer
     optimizer = AdamW(
@@ -761,6 +822,7 @@ def main():
         args=args,
         device=device,
         val_dataset=data_module.val_dataset,
+        ema_helper=ema_helper,
     )
     
     # Print codebook weights
@@ -795,4 +857,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
