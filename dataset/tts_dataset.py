@@ -415,11 +415,11 @@ class HFParquetTTSDataset(Dataset):
         return "".join(chars)
     
     def _process_codes(self, codes: np.ndarray) -> torch.Tensor:
-        """Convert interleaved 1D codes to [num_codebooks, T] tensor."""
-        # codes is [c0_t0, c1_t0, ..., cN_t0, c0_t1, ...]
-        # Reshape to [T, num_codebooks] then transpose
+        """Convert sequential 1D codes to [num_codebooks, T] tensor."""
+        # codes is SEQUENTIAL by codebook: [c0_t0, c0_t1, ..., c0_tN, c1_t0, c1_t1, ..., c1_tN, ...]
+        # Reshape directly to [num_codebooks, T]
         num_frames = len(codes) // self.num_codebooks
-        tokens = codes.reshape(num_frames, self.num_codebooks).T  # [num_codebooks, T]
+        tokens = codes.reshape(self.num_codebooks, num_frames)  # [num_codebooks, T]
         return torch.from_numpy(tokens.copy()).long()
     
     def _chunk_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
