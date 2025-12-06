@@ -1,12 +1,15 @@
 """
 TTS Training Script for TRM.
 
-Trains the TTS TRM model: text + speaker_id → ALL 32 mimi_tokens codebooks
+Trains the TTS TRM model: text + speaker_id → mimi_tokens
+
+Supports multiple dataset formats:
+- local: Pre-tokenized .pt files (original format)
+- hf_parquet: HuggingFace parquet files (e.g., emilia dataset)
 
 Multi-codebook training with weighted loss:
 - Codebook 0 (semantic): highest weight - captures linguistic content
-- Codebooks 1-7: moderate weight - early acoustic refinement
-- Codebooks 8-31: equal weight - fine acoustic details
+- Codebooks 1+: acoustic detail with decreasing weights
 """
 
 import argparse
@@ -41,6 +44,11 @@ def parse_args():
     parser.add_argument("--token-dir", type=str, default=None, help="Pre-tokenized data directory")
     parser.add_argument("--max-text-length", type=int, default=512, help="Max text length")
     parser.add_argument("--max-audio-frames", type=int, default=256, help="Max audio frames")
+    parser.add_argument("--dataset-format", type=str, default="auto", 
+                        choices=["auto", "local", "hf_parquet"],
+                        help="Dataset format: auto, local (.pt files), or hf_parquet")
+    parser.add_argument("--num-codebooks", type=int, default=None,
+                        help="Number of codebooks (None = auto-detect from dataset)")
     
     # Model
     parser.add_argument("--text-embed-dim", type=int, default=256, help="Text embedding dim")
@@ -624,9 +632,15 @@ def main():
     print("\n📁 Setting up TTS data...")
     token_dir = Path(args.token_dir) if args.token_dir else Path(args.data_dir) / "mimi_tokens"
     
-    if not token_dir.exists():
-        print(f"❌ Token directory not found: {token_dir}")
-        print(f"   Run: python pretokenize.py --data-dir {args.data_dir} --tts")
+    # Check if data exists (different checks for different formats)
+    data_path = Path(args.data_dir)
+    has_parquet = list(data_path.glob("*.parquet"))
+    has_local = token_dir.exists() and list(token_dir.rglob("*.pt"))
+    
+    if not has_parquet and not has_local:
+        print(f"❌ No data found in: {args.data_dir}")
+        print(f"   For local format: Run 'python pretokenize.py --data-dir {args.data_dir} --tts'")
+        print(f"   For HF parquet: Place .parquet files in {args.data_dir}")
         return
     
     data_module = TTSDataModule(
@@ -637,6 +651,8 @@ def main():
         max_text_length=args.max_text_length,
         max_audio_frames=args.max_audio_frames,
         pin_memory=pin_memory,
+        dataset_format=args.dataset_format,
+        num_codebooks=args.num_codebooks,
     )
     data_module.setup()
     
